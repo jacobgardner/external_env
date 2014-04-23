@@ -1,12 +1,22 @@
 import logging
 import ctypes
 import platform
-from ctypes import (byref, Structure, c_uint64, c_void_p, sizeof, c_ubyte, c_ulonglong,
-                    c_ushort, create_unicode_buffer, c_ulong)
-from binascii import hexlify
+from ctypes import (byref, Structure, c_void_p, sizeof, c_ubyte, c_ulonglong,
+                    c_ushort, create_unicode_buffer, c_ulong, c_size_t)
 
 
-def windows_function(fn, success_on_zero, exception_on_fail=True):
+def _windows_function(fn, success_on_zero, exception_on_fail=True):
+    '''
+    This does some basic error checking based on the return value.  Not all functions
+    will use GetLastError() to report errors, so you may still have to manually check
+    the return value.
+
+    :param fn: The ctypes function that you wish to wrap.
+
+    :param success_on_zero: A zero return indicates a successful run.
+
+    :exception_on_fail: Raise an exception when an error is detected.
+    '''
     def wrapped_fn(*args, **kwargs):
         success = fn(*args, **kwargs)
 
@@ -35,9 +45,9 @@ PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 
 # Windows Methods
-OpenProcess = windows_function(ctypes.windll.kernel32.OpenProcess,
+OpenProcess = _windows_function(ctypes.windll.kernel32.OpenProcess,
                                success_on_zero=False)
-IsWow64Process = windows_function(ctypes.windll.kernel32.IsWow64Process,
+IsWow64Process = _windows_function(ctypes.windll.kernel32.IsWow64Process,
                                   success_on_zero=False)
 
 
@@ -48,14 +58,14 @@ def is_wow64(handle):
     return is_wow64.value
 
 if is_wow64(ctypes.windll.kernel32.GetCurrentProcess()):
-    QueryInformationProcess = windows_function(
+    QueryInformationProcess = _windows_function(
         ctypes.windll.ntdll.NtWow64QueryInformationProcess64, success_on_zero=True)
-    ReadProcessMemory = windows_function(ctypes.windll.ntdll.NtWow64ReadVirtualMemory64,
+    ReadProcessMemory = _windows_function(ctypes.windll.ntdll.NtWow64ReadVirtualMemory64,
                                          success_on_zero=True)
-    QueryVirtualMemory = windows_function(
+    QueryVirtualMemory = _windows_function(
         ctypes.windll.ntdll.NtWow64QueryVirtualMemory64, success_on_zero=True)
 
-    class pvoid_64(Structure):
+    class arch_pointer(Structure):
         _fields_ = [
             ('low', c_void_p),
             ('high', c_void_p)
@@ -72,110 +82,134 @@ if is_wow64(ctypes.windll.kernel32.GetCurrentProcess()):
         def __sub__(lhs, rhs):
             result = long(lhs) - long(rhs)
 
-            difference = pvoid_64()
+            difference = arch_pointer()
 
             difference.low = result & 0xFFFFFF
             difference.high = result >> 32
 
             return difference
 
-    class PROCESS_BASIC_INFORMATION(Structure):
-        _fields_ = [
-            ('Reserved1', pvoid_64),
-            ('PebBaseAddress', pvoid_64),
-            ('Reserved2', pvoid_64 * 2),
-            ('UniqueProcessId', c_uint64),
-            ('Reserved3', pvoid_64)
-        ]
-
-    class UNICODE_STRING(Structure):
-        _fields_ = [
-            ('Length', c_ushort),
-            ('MaximumLength', c_ushort),
-            ('String', pvoid_64),
-        ]
-
-    class MEMORY_BASIC_INFORMATION(Structure):
-        _fields_ = [
-            ('BaseAddress', pvoid_64),
-            ('AllocationBase', pvoid_64),
-            ('AllocationProtect', c_ulong),
-            ('RegionSize', c_ulonglong),
-            ('State', c_ulong),
-            ('Protect', c_ulong),
-            ('Type', c_ulong)
-        ]
+    size_t = c_ulonglong
 
 else:
-    QueryInformationProcess = windows_function(
+    QueryInformationProcess = _windows_function(
         ctypes.windll.ntdll.NtQueryInformationProcess, success_on_zero=True)
-    ReadProcessMemory = windows_function(ctypes.windll.kernel32.ReadProcessMemory,
+    ReadProcessMemory = _windows_function(ctypes.windll.ntdll.NtReadVirtualMemory,
                                          success_on_zero=False)
+    QueryVirtualMemory = _windows_function(ctypes.windll.ntdll.NtQueryVirtualMemory,
+                                          success_on_zero=True)
 
-    class PROCESS_BASIC_INFORMATION(Structure):
-        _fields_ = [
-            ('Reserved1', c_void_p),
-            ('PebBaseAddress', c_void_p),
-            ('Reserved2', c_void_p * 2),
-            ('UniqueProcessId', c_void_p),
-            ('Reserved3', c_void_p)
-        ]
+    arch_pointer = c_void_p
+    size_t = c_size_t
+
+
+class MEMORY_BASIC_INFORMATION(Structure):
+    _fields_ = [
+        ('BaseAddress', arch_pointer),
+        ('AllocationBase', arch_pointer),
+        ('AllocationProtect', c_ulong),
+        ('RegionSize', size_t),
+        ('State', c_ulong),
+        ('Protect', c_ulong),
+        ('Type', c_ulong)
+    ]
+
+
+class PROCESS_BASIC_INFORMATION(Structure):
+    _fields_ = [
+        ('Reserved1', arch_pointer),
+        ('PebBaseAddress', arch_pointer),
+        ('Reserved2', arch_pointer * 2),
+        ('UniqueProcessId', arch_pointer),
+        ('Reserved3', arch_pointer)
+    ]
+
+
+class UNICODE_STRING(Structure):
+    _fields_ = [
+        ('Length', c_ushort),
+        ('MaximumLength', c_ushort),
+        ('String', arch_pointer),
+    ]
 
 
 def has_read_access(handle, address):
     mbi = MEMORY_BASIC_INFORMATION()
 
-    size = c_ulonglong()
-    mbi_size = c_ulonglong(sizeof(mbi))
+    size = size_t()
+    mbi_size = size_t(sizeof(mbi))
 
+    # We use QueryVirtualMemory since there's a 64 bit accessible function on emulated
+    #   programs.  It should return the MEMORY_BASIC_INFORMATION containing the region
+    #   size.
     QueryVirtualMemory(handle, address, 0, byref(mbi), mbi_size, byref(size))
 
+    # Even though we put in a specific address, the mbi gives us the entire region size, so
+    #   So we get the remaining region size by subtracting the address we put in by the
+    #   BaseAddress (basically the start of the nearest page border)
     return mbi.RegionSize - long(address - mbi.BaseAddress)
 
 
 def find_env(pid):
+    # We open the process with permissions that allow us to read the appropriate memory
+    #   blocks.
     handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
 
     if not handle:
         raise Exception('OpenProcess on {0} failed.'.format(pid))
 
+    # Not sure if this is the best way or not.
     is64bit = platform.machine() == 'AMD64'
 
+    # Because pointers are twice as large in 64 bits, the offsets are different
     ProcessParametersOffset = 0x20 if is64bit else 0x10
     EnvOffset = 0x7c if is64bit else 0x48
 
-    size = c_ulonglong()
+    size = size_t()
 
-    peb_size = c_ulonglong(ProcessParametersOffset + 8)
+    peb_size = size_t(ProcessParametersOffset + 8)
     peb = (c_ubyte * peb_size.value)()
-    pp_size = c_ulonglong(EnvOffset + 16)
+    pp_size = size_t(EnvOffset + 16)
     pp = (c_ubyte * pp_size.value)()
 
+
+    # The process basic information structure, when populated contains a pointer to
+    #   the PEB (process environment block) which contains pointers to various environment
+    #   details including the command line used to execute the program.
     pbi = PROCESS_BASIC_INFORMATION()
 
     QueryInformationProcess(handle, 0, byref(pbi), sizeof(pbi), None)
 
+    # We're reading the PEB into our PEB byte block.
     ReadProcessMemory(handle, pbi.PebBaseAddress, byref(peb), peb_size, byref(size))
 
+    # At the correct offset is a pointer to the ProcessParameters structure which contains
+    #   the environment and the command line information.
     parameters = (c_ubyte * 8)(*peb[ProcessParametersOffset:])
 
-    param_addr = pvoid_64.from_buffer_copy(parameters)
+    param_addr = arch_pointer.from_buffer_copy(parameters)
     ReadProcessMemory(handle, param_addr, byref(pp), pp_size, byref(size))
 
-
+    # The environment string is in a UNICODE_STRING structure which, for some reason,
+    #   doesn't contain the correct size of the string length.  For this reason for now we
+    #   just copy the rest of the region (expensive) and parse until we see 2 null
+    #   characters in a row.
     env = (c_ubyte * 16)(*pp[EnvOffset:])
     environment = UNICODE_STRING.from_buffer_copy(env)
 
     region_size = has_read_access(handle, environment.String)
 
     env_str = create_unicode_buffer('\000' * (region_size / 2))
-    env_str_size = c_ulonglong(region_size)
+    env_str_size = size_t(region_size)
 
-    ret_code = c_ulong(ReadProcessMemory(handle, environment.String, byref(env_str), env_str_size, byref(size)))
+    c_ulong(ReadProcessMemory(handle, environment.String, byref(env_str),
+                              env_str_size, byref(size)))
 
     buffers = []
     start = 0
 
+    # Each env variable/value is separated by a null character.  Two of these denote the end
+    #   of the environment variables section.
     for idx, v in enumerate(env_str):
         if ord(v) == 0:
             if start - idx:
